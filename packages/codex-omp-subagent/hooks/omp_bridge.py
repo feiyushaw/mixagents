@@ -19,6 +19,7 @@ import pathlib
 import shlex
 import subprocess
 import sys
+import tempfile
 from typing import Any, Optional
 import uuid
 
@@ -44,15 +45,18 @@ def state_root(value: Optional[str] = None) -> pathlib.Path:
     override = os.environ.get("CODEX_OMP_HANDOFF_DIR")
     if override:
         return pathlib.Path(override).expanduser().resolve()
-    if os.name == "nt":
-        local_app_data = os.environ.get("LOCALAPPDATA")
-        if local_app_data:
-            return pathlib.Path(local_app_data) / "Codex" / "omp-subagent-handoff"
-    return (
-        pathlib.Path(os.environ.get("XDG_STATE_HOME", pathlib.Path.home() / ".local" / "state"))
-        / "codex"
-        / "omp-subagent-handoff"
-    )
+
+    # Codex's :workspace permission profile includes system temporary
+    # directories as writable roots. A home-state default such as
+    # ~/.local/state is not guaranteed writable from a workspace-scoped parent
+    # or child session, so keep the bridge's ephemeral coordination state in
+    # the system temp area by default. The directory itself is user-private on
+    # POSIX and CODEX_OMP_HANDOFF_DIR remains available for explicit persistent
+    # storage when the caller has granted that path.
+    temp_root = pathlib.Path(tempfile.gettempdir()).resolve()
+    if os.name == "posix" and hasattr(os, "getuid"):
+        return temp_root / f"codex-omp-subagent-{os.getuid()}"
+    return temp_root / "codex-omp-subagent"
 
 
 def ensure_layout(root: pathlib.Path) -> None:
@@ -197,6 +201,7 @@ def stage(root: pathlib.Path, ttl_seconds: int, cwd: Optional[str]) -> None:
             "agent_type": AGENT_TYPE,
             "expires_at": envelope["expires_at"],
             "cwd": target_cwd,
+            "state_root": str(root),
             "pending_path": str(pending_path),
             "job_dir": str(job_dir),
         },
