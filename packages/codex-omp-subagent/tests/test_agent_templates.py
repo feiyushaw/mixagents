@@ -19,9 +19,10 @@ def test_omp_worker_toml():
         data = tomllib.load(f)
 
     assert data["name"] == "omp_worker"
-    assert "description" in data
     assert "$use-omp-worker" in data["description"]
-    assert "developer_instructions" in data
+    assert "--mode run" in data["developer_instructions"]
+    assert "handoff UUID" in data["developer_instructions"]
+    assert "SubagentStart" not in data["developer_instructions"]
     assert data["sandbox_mode"] == "workspace-write"
 
 
