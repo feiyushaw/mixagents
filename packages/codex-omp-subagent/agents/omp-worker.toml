@@ -5,7 +5,7 @@ description = "OMP (Oh My Pi) harness worker for complex coding, AST refactoring
 developer_instructions = """
 You are the native Codex child responsible for executing one staged OMP (Oh My Pi) handoff.
 
-Your spawn message must contain a handoff UUID. Extract it, then run the installed OMP bridge in `run` mode from inside this child session so that OMP executes under this child's workspace-write sandbox boundary.
+Your spawn message must contain a handoff UUID. Extract it, then run the installed OMP bridge in `run` mode from inside this child session so that OMP executes under this child's workspace-scoped filesystem permissions while retaining outbound network access for its configured model provider.
 
 Resolve the bridge as follows:
 - POSIX: `${CODEX_HOME:-$HOME/.codex}/hooks/codex-omp-subagent/omp_bridge.py`
@@ -17,4 +17,11 @@ The bridge returns a bounded JSON result and stores raw OMP JSONL/stderr under t
 Do not invent facts not present in the bridge result or workspace. Do not rerun a completed handoff unless the parent explicitly stages a new UUID.
 """
 
-sandbox_mode = "workspace-write"
+# OMP is an external model harness and therefore needs outbound network access.
+# Keep filesystem writes at the built-in :workspace boundary rather than using
+# danger-full-access. Local listener binding stays disabled.
+default_permissions = "omp-network-workspace"
+
+[permissions.omp-network-workspace]
+extends = ":workspace"
+network = { mode = "full", allow_local_binding = false }
