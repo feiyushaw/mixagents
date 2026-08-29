@@ -52,7 +52,7 @@ class OmpBridgeV2Tests(unittest.TestCase):
         mock = self.state_dir / "mock_omp.py"
         mock.write_text(
             "import json, sys\n"
-            "print(json.dumps({'type':'message_end','message':{'role':'assistant','content':[{'type':'text','text':'OMP_READY'}]},'usage':{'input':10,'output':2}}))\n"
+            "print(json.dumps({'type':'message_end','message':{'role':'assistant','content':[{'type':'text','text':'OMP_READY'}],'usage':{'input':10,'output':2},'stopReason':'stop'}}))\n"
             "print('mock warning', file=sys.stderr)\n",
             encoding="utf-8",
         )
@@ -63,6 +63,7 @@ class OmpBridgeV2Tests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
         self.assertEqual(payload["status"], "success")
+        self.assertEqual(payload["stop_reason"], "stop")
         self.assertIn("OMP_READY", payload["summary"])
         self.assertEqual(payload["parsed_json_events"], 1)
         self.assertEqual(payload["usage"]["input"], 10)
@@ -89,6 +90,49 @@ class OmpBridgeV2Tests(unittest.TestCase):
         self.assertEqual(first.returncode, 0)
         self.assertEqual(second.returncode, 0)
         self.assertEqual(json.loads(first.stdout), json.loads(second.stdout))
+
+    def test_structured_provider_error_overrides_zero_exit(self):
+        staged = self.stage("Trigger provider error")
+        mock = self.state_dir / "provider_error_mock.py"
+        mock.write_text(
+            "import json\n"
+            "print(json.dumps({'type':'message_end','message':{'role':'assistant','content':[{'type':'text','text':'provider failed'}],'usage':{'input':7,'output':1},'stopReason':'error','errorMessage':'quota exceeded'}}))\n",
+            encoding="utf-8",
+        )
+        result = self.run_bridge(
+            ["--mode", "run", "--handoff-id", staged["handoff_id"]],
+            env={"OMP_BIN": f"{sys.executable} {mock}"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["exit_code"], 0)
+        self.assertEqual(payload["status"], "failed")
+        self.assertEqual(payload["execution_state"], "provider_error")
+        self.assertEqual(payload["stop_reason"], "error")
+        self.assertEqual(payload["structured_error"], "quota exceeded")
+        self.assertEqual(payload["usage"]["input"], 7)
+        self.assertTrue(
+            (self.state_dir / "failed" / f"{staged['handoff_id']}.json").exists()
+        )
+
+    def test_truncated_terminal_record_keeps_complete_message_end(self):
+        staged = self.stage("Return before truncated agent_end")
+        mock = self.state_dir / "truncated_mock.py"
+        mock.write_text(
+            "import json\n"
+            "print(json.dumps({'type':'message_end','message':{'role':'assistant','content':[{'type':'text','text':'COMPLETE_MESSAGE'}],'usage':{'input':3,'output':1},'stopReason':'stop'}}))\n"
+            "print('{\"type\":\"agent_end\",\"messages\":[')\n",
+            encoding="utf-8",
+        )
+        result = self.run_bridge(
+            ["--mode", "run", "--handoff-id", staged["handoff_id"]],
+            env={"OMP_BIN": f"{sys.executable} {mock}"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["status"], "success")
+        self.assertIn("COMPLETE_MESSAGE", payload["summary"])
+        self.assertEqual(payload["parsed_json_events"], 1)
 
     def test_invalid_handoff_id(self):
         result = self.run_bridge(["--mode", "run", "--handoff-id", "not-a-uuid"])
