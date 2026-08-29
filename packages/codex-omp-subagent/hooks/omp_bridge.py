@@ -141,6 +141,29 @@ def load_json(path: pathlib.Path) -> dict[str, Any]:
     return value
 
 
+def split_cli_words(value: str) -> list[str]:
+    """Split a user-supplied command fragment using host-native quoting rules."""
+    if os.name != "nt":
+        return shlex.split(value)
+
+    # Python's shlex is POSIX-oriented and corrupts Windows paths such as
+    # C:\\hostedtoolcache\\... by treating backslashes as escapes. Use the same
+    # Windows argv parser used by native processes instead.
+    import ctypes
+
+    argc = ctypes.c_int()
+    command_line_to_argv = ctypes.windll.shell32.CommandLineToArgvW
+    command_line_to_argv.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_int)]
+    command_line_to_argv.restype = ctypes.POINTER(ctypes.c_wchar_p)
+    argv = command_line_to_argv(value, ctypes.byref(argc))
+    if not argv:
+        raise OSError(ctypes.get_last_error(), "CommandLineToArgvW failed")
+    try:
+        return [argv[index] for index in range(argc.value)]
+    finally:
+        ctypes.windll.kernel32.LocalFree(ctypes.cast(argv, ctypes.c_void_p))
+
+
 def stage(root: pathlib.Path, ttl_seconds: int, cwd: Optional[str]) -> None:
     assignment = sys.stdin.read()
     if not assignment.strip():
@@ -267,14 +290,14 @@ def parse_omp_jsonl(
 
 def build_omp_command(assignment: str) -> list[str]:
     omp_bin = os.environ.get("OMP_BIN", "omp")
-    command = shlex.split(omp_bin)
+    command = split_cli_words(omp_bin)
     if not command:
         fail("OMP_BIN resolved to an empty command.", 14)
 
     omp_args_env = os.environ.get("OMP_ARGS")
     if omp_args_env is not None:
         if omp_args_env.strip():
-            command.extend(shlex.split(omp_args_env))
+            command.extend(split_cli_words(omp_args_env))
     else:
         command.extend(["--print", "--mode", "json", "--no-session"])
 
