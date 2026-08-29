@@ -199,10 +199,14 @@ def _flatten_text(value: Any) -> list[str]:
     return texts
 
 
-def parse_omp_jsonl(stdout: str) -> tuple[str, Optional[dict[str, Any]], int]:
+def parse_omp_jsonl(
+    stdout: str,
+) -> tuple[str, Optional[dict[str, Any]], int, Optional[str], Optional[str]]:
     final_text = ""
     usage: Optional[dict[str, Any]] = None
     parsed_events = 0
+    stop_reason: Optional[str] = None
+    error_message: Optional[str] = None
 
     for raw_line in stdout.splitlines():
         line = raw_line.strip()
@@ -211,6 +215,9 @@ def parse_omp_jsonl(stdout: str) -> tuple[str, Optional[dict[str, Any]], int]:
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
+            # Keep parsing earlier complete records. OMP has had JSON-mode cases
+            # where a large final agent_end record was truncated after a complete
+            # assistant message_end.
             continue
         if not isinstance(event, dict):
             continue
@@ -220,6 +227,20 @@ def parse_omp_jsonl(stdout: str) -> tuple[str, Optional[dict[str, Any]], int]:
         if isinstance(event_usage, dict):
             usage = event_usage
 
+        message = event.get("message")
+        if isinstance(message, dict):
+            message_usage = message.get("usage")
+            if isinstance(message_usage, dict):
+                usage = message_usage
+
+            if message.get("role") == "assistant":
+                raw_stop_reason = message.get("stopReason") or message.get("stop_reason")
+                if isinstance(raw_stop_reason, str) and raw_stop_reason:
+                    stop_reason = raw_stop_reason
+                raw_error = message.get("errorMessage") or message.get("error_message")
+                if isinstance(raw_error, str) and raw_error:
+                    error_message = raw_error
+
         event_type = str(event.get("type") or event.get("event") or "").lower()
         role = str(event.get("role") or "").lower()
         is_finalish = (
@@ -228,8 +249,7 @@ def parse_omp_jsonl(stdout: str) -> tuple[str, Optional[dict[str, Any]], int]:
         )
         if is_finalish:
             candidates = _flatten_text(
-                event.get("message")
-                if "message" in event
+                message if isinstance(message, dict)
                 else event.get("content", event.get("text", event))
             )
             if candidates:
@@ -242,7 +262,7 @@ def parse_omp_jsonl(stdout: str) -> tuple[str, Optional[dict[str, Any]], int]:
 
     if len(final_text) > MAX_SUMMARY_CHARS:
         final_text = final_text[:MAX_SUMMARY_CHARS] + "\n...[truncated; see omp.jsonl]"
-    return final_text, usage, parsed_events
+    return final_text, usage, parsed_events, stop_reason, error_message
 
 
 def build_omp_command(assignment: str) -> list[str]:
@@ -373,9 +393,16 @@ def run_job(root: pathlib.Path, handoff_id_value: str, timeout_seconds: int) -> 
 
         (job_dir / "omp.jsonl").write_text(stdout, encoding="utf-8", errors="replace")
         (job_dir / "stderr.log").write_text(stderr, encoding="utf-8", errors="replace")
-        summary, usage, parsed_events = parse_omp_jsonl(stdout)
+        summary, usage, parsed_events, stop_reason, structured_error = parse_omp_jsonl(stdout)
 
-        status = "success" if returncode == 0 else "failed"
+        provider_failed = (
+            (stop_reason or "").lower() in {"error", "aborted"}
+            or bool(structured_error)
+        )
+        status = "success" if returncode == 0 and not provider_failed else "failed"
+        if returncode == 0 and provider_failed:
+            execution_state = "provider_error"
+
         result: dict[str, Any] = {
             "schema": SCHEMA,
             "handoff_id": handoff_id,
@@ -383,6 +410,8 @@ def run_job(root: pathlib.Path, handoff_id_value: str, timeout_seconds: int) -> 
             "status": status,
             "execution_state": execution_state,
             "exit_code": returncode,
+            "stop_reason": stop_reason,
+            "structured_error": structured_error,
             "cwd": target_cwd,
             "summary": summary,
             "usage": usage,
@@ -401,7 +430,7 @@ def run_job(root: pathlib.Path, handoff_id_value: str, timeout_seconds: int) -> 
         }
         atomic_write_json(job_dir / "result.json", result)
 
-        terminal_dir = "completed" if returncode == 0 else "failed"
+        terminal_dir = "completed" if status == "success" else "failed"
         terminal_path = root / terminal_dir / f"{handoff_id}.json"
         try:
             os.replace(running_path, terminal_path)
